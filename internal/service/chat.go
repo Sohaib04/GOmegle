@@ -19,14 +19,20 @@ type ChatService struct {
 	// have an entry pointing to the same *Session.
 	sessions map[string]*models.Session
 	mu       sync.RWMutex
+
+	// userInterests caches interests for each user so we can re-enqueue with
+	// the same interests after "next".
+	userInterests map[string][]string
+	interestsMu   sync.RWMutex
 }
 
 // NewChatService creates a new ChatService and wires up Hub callbacks.
 func NewChatService(hub *websocket.Hub, queue *matchmaking.Queue) *ChatService {
 	cs := &ChatService{
-		hub:      hub,
-		queue:    queue,
-		sessions: make(map[string]*models.Session),
+		hub:           hub,
+		queue:         queue,
+		sessions:      make(map[string]*models.Session),
+		userInterests: make(map[string][]string),
 	}
 
 	// Wire up Hub callbacks so the Hub routes events to us.
@@ -46,15 +52,16 @@ func (cs *ChatService) Start() {
 // creates sessions for each pair.
 func (cs *ChatService) matchConsumer() {
 	for pair := range cs.queue.MatchedPairs() {
-		cs.createSession(pair[0], pair[1])
+		cs.createSession(pair.User1, pair.User2, pair.CommonInterests)
 	}
 }
 
 // createSession sets up a new chat session between two users and notifies them.
-func (cs *ChatService) createSession(user1, user2 string) {
+func (cs *ChatService) createSession(user1, user2 string, commonInterests []string) {
 	session := &models.Session{
-		User1: user1,
-		User2: user2,
+		User1:           user1,
+		User2:           user2,
+		CommonInterests: commonInterests,
 	}
 
 	cs.mu.Lock()
@@ -63,15 +70,15 @@ func (cs *ChatService) createSession(user1, user2 string) {
 	if _, exists := cs.sessions[user1]; exists {
 		cs.mu.Unlock()
 		log.Printf("service: user %s already in session, re-enqueuing both", user1)
-		cs.queue.Enqueue(user1)
-		cs.queue.Enqueue(user2)
+		cs.enqueueWithCachedInterests(user1)
+		cs.enqueueWithCachedInterests(user2)
 		return
 	}
 	if _, exists := cs.sessions[user2]; exists {
 		cs.mu.Unlock()
 		log.Printf("service: user %s already in session, re-enqueuing both", user2)
-		cs.queue.Enqueue(user1)
-		cs.queue.Enqueue(user2)
+		cs.enqueueWithCachedInterests(user1)
+		cs.enqueueWithCachedInterests(user2)
 		return
 	}
 
@@ -79,12 +86,13 @@ func (cs *ChatService) createSession(user1, user2 string) {
 	cs.sessions[user2] = session
 	cs.mu.Unlock()
 
-	log.Printf("service: session created between %s and %s", user1, user2)
+	log.Printf("service: session created between %s and %s (common: %v)", user1, user2, commonInterests)
 
 	// Notify both users they've been matched.
 	matchedMsg := models.Message{
-		Type:    models.MessageTypeSystem,
-		Content: "You've been matched with a stranger. Say hi!",
+		Type:            models.MessageTypeSystem,
+		Content:         "You're now chatting with a random stranger. Say hi!",
+		CommonInterests: commonInterests,
 	}
 	cs.hub.SendToClient(user1, matchedMsg)
 	cs.hub.SendToClient(user2, matchedMsg)
@@ -99,9 +107,35 @@ func (cs *ChatService) HandleMessage(clientID string, msg models.Message) {
 	case models.MessageTypeNext:
 		cs.HandleNext(clientID)
 
+	case models.MessageTypeTyping:
+		cs.relayTypingStatus(clientID, models.MessageTypeTyping)
+
+	case models.MessageTypeStopTyping:
+		cs.relayTypingStatus(clientID, models.MessageTypeStopTyping)
+
 	default:
 		log.Printf("service: unknown message type from %s: %s", clientID, msg.Type)
 	}
+}
+
+// relayTypingStatus forwards typing/stop_typing to the sender's partner.
+func (cs *ChatService) relayTypingStatus(senderID string, msgType models.MessageType) {
+	cs.mu.RLock()
+	session, exists := cs.sessions[senderID]
+	cs.mu.RUnlock()
+
+	if !exists || session == nil {
+		return
+	}
+
+	partnerID := session.Partner(senderID)
+	if partnerID == "" {
+		return
+	}
+
+	cs.hub.SendToClient(partnerID, models.Message{
+		Type: msgType,
+	})
 }
 
 // relayMessage forwards a chat message to the sender's matched partner.
@@ -138,7 +172,7 @@ func (cs *ChatService) HandleNext(userID string) {
 	if !exists || session == nil {
 		cs.mu.Unlock()
 		// Not in a session — just ensure they're in the queue.
-		cs.queue.Enqueue(userID)
+		cs.enqueueWithCachedInterests(userID)
 		return
 	}
 
@@ -160,12 +194,12 @@ func (cs *ChatService) HandleNext(userID string) {
 				Content: "Stranger has disconnected.",
 			})
 			// Re-enqueue the partner so they can find a new match.
-			cs.queue.Enqueue(partnerID)
+			cs.enqueueWithCachedInterests(partnerID)
 		}
 	}
 
 	// Re-enqueue the user who pressed next.
-	cs.queue.Enqueue(userID)
+	cs.enqueueWithCachedInterests(userID)
 }
 
 // HandleDisconnect handles a client disconnecting (closing the WebSocket).
@@ -174,6 +208,11 @@ func (cs *ChatService) HandleDisconnect(userID string) {
 
 	// Remove from matchmaking queue if they were waiting.
 	cs.queue.Dequeue(userID)
+
+	// Clean up cached interests.
+	cs.interestsMu.Lock()
+	delete(cs.userInterests, userID)
+	cs.interestsMu.Unlock()
 
 	cs.mu.Lock()
 	session, exists := cs.sessions[userID]
@@ -200,13 +239,32 @@ func (cs *ChatService) HandleDisconnect(userID string) {
 				Content: "Stranger has disconnected.",
 			})
 			// Re-enqueue the partner for a new match.
-			cs.queue.Enqueue(partnerID)
+			cs.enqueueWithCachedInterests(partnerID)
 		}
 	}
 }
 
-// EnqueueUser adds a user to the matchmaking queue.
+// EnqueueUser adds a user to the matchmaking queue with interests.
 // Called by the handler after a new WebSocket connection is established.
-func (cs *ChatService) EnqueueUser(userID string) {
-	cs.queue.Enqueue(userID)
+func (cs *ChatService) EnqueueUser(userID string, interests []string) {
+	// Cache interests for re-enqueue on "next".
+	cs.interestsMu.Lock()
+	cs.userInterests[userID] = interests
+	cs.interestsMu.Unlock()
+
+	cs.queue.Enqueue(userID, interests)
+}
+
+// enqueueWithCachedInterests re-enqueues a user using their cached interests.
+func (cs *ChatService) enqueueWithCachedInterests(userID string) {
+	cs.interestsMu.RLock()
+	interests := cs.userInterests[userID]
+	cs.interestsMu.RUnlock()
+
+	cs.queue.Enqueue(userID, interests)
+}
+
+// GetOnlineCount returns the number of connected clients.
+func (cs *ChatService) GetOnlineCount() int {
+	return cs.hub.ClientCount()
 }

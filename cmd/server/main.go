@@ -30,7 +30,7 @@ func main() {
 
 	// --- 3. Create Fiber app with middleware ---
 	app := fiber.New(fiber.Config{
-		AppName: "GOmegle v1.0.0",
+		AppName: "GOmegle v2.0.0",
 	})
 
 	app.Use(logger.New())
@@ -40,19 +40,28 @@ func main() {
 		AllowHeaders: "Origin, Content-Type, Accept",
 	}))
 
-	// --- 4. Health check endpoint ---
+	// --- 4. API routes ---
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"status":  "ok",
 			"service": "GOmegle",
+			"version": "2.0.0",
 		})
 	})
+
+	app.Get("/api/stats", wsHandler.HandleStats())
 
 	// --- 5. WebSocket route ---
 	app.Use("/ws", wsHandler.UpgradeMiddleware())
 	app.Get("/ws", wsHandler.HandleWebSocket())
 
-	// --- 6. Graceful shutdown ---
+	// --- 6. Serve static frontend files ---
+	app.Static("/", "./web", fiber.Static{
+		Index:  "index.html",
+		Browse: false,
+	})
+
+	// --- 7. Graceful shutdown ---
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -64,7 +73,7 @@ func main() {
 		}
 	}()
 
-	// --- 7. Start listening ---
+	// --- 8. Start listening ---
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

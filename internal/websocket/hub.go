@@ -13,6 +13,20 @@ type IncomingMessage struct {
 	Message  models.Message
 }
 
+// sendRequest is used to send a message to a specific client through the
+// Run() goroutine, eliminating race conditions on the clients map.
+type sendRequest struct {
+	ClientID string
+	Data     []byte
+	Result   chan bool
+}
+
+// countRequest is used to get the current client count through the
+// Run() goroutine, eliminating race conditions on the clients map.
+type countRequest struct {
+	Result chan int
+}
+
 // MessageHandler is a callback invoked when a message arrives from a client.
 type MessageHandler func(clientID string, msg models.Message)
 
@@ -35,6 +49,12 @@ type Hub struct {
 	// Incoming channel for messages from clients.
 	Incoming chan *IncomingMessage
 
+	// send routes send requests through Run() to avoid races.
+	send chan sendRequest
+
+	// count routes count requests through Run() to avoid races.
+	count chan countRequest
+
 	// OnMessage is called when a message is received from a client.
 	OnMessage MessageHandler
 
@@ -49,6 +69,8 @@ func NewHub() *Hub {
 		Register:   make(chan *Client),
 		Unregister: make(chan *Client),
 		Incoming:   make(chan *IncomingMessage, 256),
+		send:       make(chan sendRequest, 256),
+		count:      make(chan countRequest),
 	}
 }
 
@@ -77,12 +99,29 @@ func (h *Hub) Run() {
 			if h.OnMessage != nil {
 				h.OnMessage(incoming.ClientID, incoming.Message)
 			}
+
+		case req := <-h.send:
+			client, ok := h.clients[req.ClientID]
+			if !ok {
+				req.Result <- false
+				continue
+			}
+			select {
+			case client.Send <- req.Data:
+				req.Result <- true
+			default:
+				log.Printf("client %s send buffer full, dropping message", req.ClientID)
+				req.Result <- false
+			}
+
+		case req := <-h.count:
+			req.Result <- len(h.clients)
 		}
 	}
 }
 
 // SendToClient sends a message to a specific client by ID.
-// Returns false if the client is not found.
+// This is thread-safe — the request is routed through the Run() goroutine.
 func (h *Hub) SendToClient(clientID string, msg models.Message) bool {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -90,38 +129,22 @@ func (h *Hub) SendToClient(clientID string, msg models.Message) bool {
 		return false
 	}
 
-	// We need to send through a channel to avoid blocking the caller.
-	// The Hub's Run loop is the only place that touches h.clients directly,
-	// but SendToClient can be called from any goroutine. To avoid a race
-	// on h.clients, we use a non-blocking approach: try to find the client
-	// and send to its channel.
-	//
-	// NOTE: This method is safe because:
-	// 1. The Send channel is only closed in the Unregister handler.
-	// 2. We use a select with default to avoid blocking if the channel is full.
-	// 3. If the client was just unregistered, the recover will catch the panic
-	//    from sending on a closed channel.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("recovered from send to disconnected client %s: %v", clientID, r)
-		}
-	}()
-
-	// We access h.clients here which technically could race with Run().
-	// To keep things simple and avoid complex synchronization for this MVP,
-	// we'll use a safe send pattern. For production, this should go through
-	// a channel-based request to the Run loop.
-	client, ok := h.clients[clientID]
-	if !ok {
-		return false
+	req := sendRequest{
+		ClientID: clientID,
+		Data:     data,
+		Result:   make(chan bool, 1),
 	}
 
-	select {
-	case client.Send <- data:
-		return true
-	default:
-		// Client's send buffer is full; they're too slow.
-		log.Printf("client %s send buffer full, dropping message", clientID)
-		return false
+	h.send <- req
+	return <-req.Result
+}
+
+// ClientCount returns the number of currently connected clients.
+// This is thread-safe — the request is routed through the Run() goroutine.
+func (h *Hub) ClientCount() int {
+	req := countRequest{
+		Result: make(chan int, 1),
 	}
+	h.count <- req
+	return <-req.Result
 }
