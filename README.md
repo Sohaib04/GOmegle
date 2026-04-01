@@ -1,4 +1,4 @@
-# GOmegle 🎭
+# GOmegle
 
 A production-quality anonymous random text chat backend — an Omegle clone built in Go.
 
