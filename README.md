@@ -1,6 +1,6 @@
-# GOmegle
+# GOmegle 🎭
 
-A production-quality anonymous random text chat backend — an Omegle clone built in Go.
+A production-quality anonymous random text chat service — an Omegle clone built in Go.
 
 ## Quick Start
 
@@ -8,21 +8,32 @@ A production-quality anonymous random text chat backend — an Omegle clone buil
 # Run the server
 go run ./cmd/server/main.go
 
-# Server starts on :8080 (override with PORT env var)
+# Open in browser
+open http://localhost:8080
+
+# Override port
 PORT=3000 go run ./cmd/server/main.go
 ```
 
-### Health Check
+### API Endpoints
 
-```bash
-curl http://localhost:8080/health
-```
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Web frontend |
+| `GET /health` | Health check |
+| `GET /api/stats` | Online user count `{"online": N}` |
+| `GET /ws?interests=a,b` | WebSocket upgrade |
 
-### Connect via WebSocket
+---
 
-```
-ws://localhost:8080/ws
-```
+## Features
+
+- **Random text chat** — Connect with a stranger instantly
+- **Interest-based matching** — Add tags to find someone with shared interests
+- **Typing indicators** — Real-time "Stranger is typing..." feedback
+- **Online count** — Live display of connected users
+- **Next / Disconnect** — Skip to a new stranger or leave
+- **Keyboard shortcuts** — Enter to send, Escape to disconnect
 
 ---
 
@@ -35,9 +46,9 @@ GOmegle/
 │       └── main.go              # App bootstrap & wiring
 ├── internal/
 │   ├── handler/
-│   │   └── ws_handler.go        # Fiber WebSocket handler
+│   │   └── ws_handler.go        # Fiber WebSocket handler + stats API
 │   ├── matchmaking/
-│   │   └── queue.go             # Thread-safe matchmaking queue
+│   │   └── queue.go             # Interest-aware matchmaking queue
 │   ├── models/
 │   │   └── models.go            # Domain types (Message, Session)
 │   ├── service/
@@ -45,6 +56,10 @@ GOmegle/
 │   └── websocket/
 │       ├── client.go            # Per-connection read/write pumps
 │       └── hub.go               # Central connection registry
+├── web/
+│   ├── index.html               # Chat UI
+│   ├── style.css                # Dark theme styles
+│   └── app.js                   # WebSocket client + state machine
 ├── go.mod
 ├── go.sum
 └── README.md
@@ -53,13 +68,13 @@ GOmegle/
 ### Data Flow
 
 ```
-Client → WS Upgrade → Handler → Hub.Register → Queue.Enqueue
+Client → WS Upgrade → Handler → Hub.Register → Queue.Enqueue(interests)
                                                       │
                                      Queue.MatchedPairs channel
                                                       │
                               ChatService.matchConsumer ← creates Session
                                                       │
-                              Hub.SendToClient("matched") → Both clients
+                              Hub.SendToClient("matched" + commonInterests) → Both clients
                                                       │
 Client A sends chat → Hub.Incoming → ChatService.relayMessage → Hub.SendToClient(B)
 ```
@@ -68,103 +83,72 @@ Client A sends chat → Hub.Incoming → ChatService.relayMessage → Hub.SendTo
 
 ## Message Protocol
 
-All messages are JSON with this structure:
+All messages are JSON:
 
 ```json
 { "type": "<type>", "content": "<text>" }
 ```
 
-| Type     | Direction       | Description                        |
-|----------|-----------------|------------------------------------|
-| `chat`   | Client → Server | Send a chat message                |
-| `chat`   | Server → Client | Receive a chat message             |
-| `system` | Server → Client | System notification                |
-| `next`   | Client → Server | Disconnect current & find new match|
-
-### System Messages
-
-| Content                                               | When                        |
-|-------------------------------------------------------|-----------------------------|
-| `You've been matched with a stranger. Say hi!`        | Two users matched           |
-| `Stranger has disconnected.`                          | Partner left or pressed next|
-| `You are not currently matched with anyone. Please wait...` | Chat sent while unmatched   |
-
----
-
-## Concurrency Model
-
-| Component              | Mechanism              | Purpose                                    |
-|------------------------|------------------------|--------------------------------------------|
-| `Hub.Run()`            | Single goroutine + channels | Serializes client map access — no locks |
-| `Client.ReadPump`      | Per-client goroutine   | Reads from WS → Hub.Incoming channel       |
-| `Client.WritePump`     | Per-client goroutine   | Drains Send channel → writes to WS         |
-| `Queue`                | `sync.Mutex`           | Protects queue slice; matching is atomic    |
-| `ChatService.sessions` | `sync.RWMutex`         | Protects session map reads/writes           |
-| Match consumer         | Goroutine              | Listens on matched channel → creates sessions |
-
-**Key invariants:**
-1. Only `Hub.Run()` modifies the clients map — zero races
-2. Queue mutex is held briefly — just slice operations
-3. Session teardown is idempotent via `Session.Close()` — safe for concurrent disconnect/next
+| Type | Direction | Description |
+|------|-----------|-------------|
+| `chat` | Both | Chat message |
+| `system` | Server → Client | System notification |
+| `next` | Client → Server | Disconnect & find new match |
+| `typing` | Both | User started typing |
+| `stop_typing` | Both | User stopped typing |
 
 ---
 
 ## Matchmaking Logic
 
-1. User connects → UUID assigned → registered in Hub → enqueued in `Queue`
-2. `Queue.Enqueue()` locks → appends → if `len ≥ 2`, pops first two → sends pair to `matched` channel
-3. `ChatService.matchConsumer()` reads pair → creates `Session` → notifies both users
-4. Messages relay through `ChatService.HandleMessage` → partner via Hub
-5. **Next**: tear down session → notify partner → re-enqueue both
-6. **Disconnect**: tear down session → notify partner → re-enqueue partner only
+1. User connects with optional interests → enqueued in `Queue`
+2. `Enqueue()` scans existing entries — prefers the one with most overlapping interests
+3. If no interest overlap, falls back to FIFO (first in queue)
+4. Matched pair receives notification with common interests displayed
 
 ---
 
-## Testing Suggestions
+## Concurrency Model
 
-### Unit Tests
+| Component | Mechanism | Purpose |
+|-----------|-----------|---------|
+| `Hub.Run()` | Single goroutine + channels | Serializes all client map access |
+| `Hub.SendToClient` | Channel-based request to Run() | Thread-safe message delivery |
+| `Client.ReadPump` | Per-client goroutine | Reads from WS → Hub.Incoming |
+| `Client.WritePump` | Per-client goroutine | Drains Send channel → WS |
+| `Queue` | `sync.Mutex` | Protects queue slice |
+| `ChatService.sessions` | `sync.RWMutex` | Protects session map |
+| Match consumer | Goroutine | Listens on matched channel |
+
+---
+
+## Testing
+
 ```bash
-go test -race ./...
-```
+# Build
+go build ./...
 
-- `matchmaking.Queue` — enqueue, dequeue, concurrent enqueue, duplicate rejection
-- `models.Session` — Close idempotency, Partner lookup
-- `service.ChatService` — mock Hub + Queue, test session creation/teardown/relay
+# Run server
+go run ./cmd/server/main.go
 
-### Integration Tests
-- Spin up Fiber app in test, connect real WS clients via `gorilla/websocket` test dialer
-- Assert: match notification, message relay, next behavior, disconnect notification
+# Open two browser tabs to http://localhost:8080
+# Add interests, click Start, chat, press New/Disconnect
 
-### Manual Test
-```javascript
-// Browser Console — Tab 1
-ws1 = new WebSocket("ws://localhost:8080/ws");
-ws1.onmessage = (e) => console.log("Tab1:", e.data);
-
-// Browser Console — Tab 2
-ws2 = new WebSocket("ws://localhost:8080/ws");
-ws2.onmessage = (e) => console.log("Tab2:", e.data);
-
-// Both should receive: {"type":"system","content":"You've been matched..."}
-
-// Send a message from Tab 1
-ws1.send(JSON.stringify({type: "chat", content: "hello!"}));
-// Tab 2 should receive: {"type":"chat","content":"hello!"}
-
-// Press next from Tab 1
-ws1.send(JSON.stringify({type: "next"}));
-// Tab 2 receives: {"type":"system","content":"Stranger has disconnected."}
+# API checks
+curl http://localhost:8080/health
+curl http://localhost:8080/api/stats
 ```
 
 ---
 
 ## Tech Stack
 
-- **Go 1.26** — language
+- **Go** — language
 - **Fiber v2** — HTTP framework
-- **gofiber/contrib/websocket** — WebSocket upgrade for Fiber
+- **gofiber/contrib/websocket** — WebSocket upgrade
 - **google/uuid** — connection IDs
-- **In-memory storage** — no database (Phase 1)
+- **Vanilla HTML/CSS/JS** — frontend
+- **In-memory storage** — no database (Phase 1-2)
 
 ## License
 
