@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="GOmegle — Talk to strangers anonymously. Random text chat with interest-based matching.">
+    <title>GOmegle — Talk to Strangers</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <!-- ===== Header ===== -->
+    <header id="header">
+        <div class="header-left">
+            <h1 id="logo">G<span class="logo-accent">Omegle</span></h1>
+            <span class="tagline">Talk to strangers.</span>
+        </div>
+        <div class="header-right">
+            <div id="online-indicator" class="online-badge">
+                <span class="pulse-dot"></span>
+                <span id="online-count">0</span> online
+            </div>
+        </div>
+    </header>
+
+    <!-- ===== Main Container ===== -->
+    <main id="app">
+        <!-- ===== Landing / Interests Panel ===== -->
+        <section id="landing-panel" class="panel">
+            <div class="landing-content">
+                <h2>Start chatting</h2>
+                <p class="landing-subtitle">You'll be matched with a random stranger. Add interests to find someone like you.</p>
+
+                <div class="interests-section">
+                    <label for="interest-input">Your interests <span class="optional">(optional)</span></label>
+                    <div class="interest-input-wrapper">
+                        <div id="interest-tags" class="interest-tags"></div>
+                        <input
+                            type="text"
+                            id="interest-input"
+                            placeholder="Add an interest and press Enter..."
+                            autocomplete="off"
+                            maxlength="30"
+                        >
+                    </div>
+                </div>
+
+                <button id="start-btn" class="btn btn-primary">
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                    </svg>
+                    Start Text Chat
+                </button>
+            </div>
+        </section>
+
+        <!-- ===== Chat Panel (hidden initially) ===== -->
+        <section id="chat-panel" class="panel hidden">
+            <!-- Status Bar -->
+            <div id="status-bar" class="status-bar">
+                <span id="status-text" class="status-text">Connecting...</span>
+            </div>
+
+            <!-- Common Interests Display -->
+            <div id="common-interests" class="common-interests hidden">
+                You both like: <span id="common-interests-list"></span>
+            </div>
+
+            <!-- Chat Log -->
+            <div id="chat-log" class="chat-log">
+                <!-- Messages will be injected here -->
+            </div>
+
+            <!-- Typing Indicator -->
+            <div id="typing-indicator" class="typing-indicator hidden">
+                <span class="typing-text">Stranger is typing</span>
+                <span class="typing-dots">
+                    <span>.</span><span>.</span><span>.</span>
+                </span>
+            </div>
+
+            <!-- Message Input -->
+            <div id="message-bar" class="message-bar">
+                <input
+                    type="text"
+                    id="message-input"
+                    placeholder="Type a message..."
+                    autocomplete="off"
+                    maxlength="2000"
+                    disabled
+                >
+                <button id="send-btn" class="btn btn-send" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="22" y1="2" x2="11" y2="13"/>
+                        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Controls -->
+            <div class="chat-controls">
+                <button id="disconnect-btn" class="btn btn-danger">
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                    Disconnect
+                </button>
+                <button id="new-btn" class="btn btn-secondary hidden">
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="23 4 23 10 17 10"/>
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                    </svg>
+                    New Chat
+                </button>
+            </div>
+        </section>
+    </main>
+
+    <!-- ===== Footer ===== -->
+    <footer id="footer">
+        <p>GOmegle &mdash; Built with Go + Fiber + WebSockets</p>
+    </footer>
+
+    <script src="/app.js"></script>
+</body>
+</html>
