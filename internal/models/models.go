@@ -18,6 +18,12 @@ const (
 	MessageTypeSystem MessageType = "system"
 	// MessageTypeNext signals the user wants to disconnect and find a new match.
 	MessageTypeNext MessageType = "next"
+	// MessageTypeDisconnect signals the user wants to end their current chat session.
+	MessageTypeDisconnect MessageType = "disconnect"
+	// MessageTypeFindMatch signals the user wants to enter the matchmaking queue.
+	MessageTypeFindMatch MessageType = "find_match"
+	// MessageTypeLeaveQueue signals the user wants to leave the matchmaking queue.
+	MessageTypeLeaveQueue MessageType = "leave_queue"
 	// MessageTypeTyping signals the user is currently typing.
 	MessageTypeTyping MessageType = "typing"
 	// MessageTypeStopTyping signals the user has stopped typing.

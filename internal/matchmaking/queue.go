@@ -64,7 +64,7 @@ func (q *Queue) Enqueue(userID string, interests []string, mode string) {
 	bestOverlap := 0
 
 	for i, entry := range q.queue {
-		if entry.Mode != mode {
+		if entry.Mode != mode || entry.UserID == userID {
 			continue
 		}
 
@@ -78,7 +78,7 @@ func (q *Queue) Enqueue(userID string, interests []string, mode string) {
 	// If no interest match found within the same mode, fall back to FIFO for this mode.
 	if bestIdx == -1 {
 		for i, entry := range q.queue {
-			if entry.Mode == mode {
+			if entry.Mode == mode && entry.UserID != userID {
 				bestIdx = i
 				break
 			}

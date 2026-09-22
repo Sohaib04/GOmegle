@@ -197,6 +197,7 @@
         try {
             localStream = await navigator.mediaDevices.getUserMedia(constraints);
             dom.localVideo.srcObject = localStream;
+            dom.localVideo.play().catch((err) => console.warn('Local video play error:', err));
             dom.localPlaceholder.classList.add('hidden');
             isVideoEnabled = true;
             isAudioEnabled = true;
@@ -207,6 +208,7 @@
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 dom.localVideo.srcObject = localStream;
+                dom.localVideo.play().catch((err) => console.warn('Local video play error:', err));
                 dom.localPlaceholder.classList.add('hidden');
                 isVideoEnabled = true;
                 isAudioEnabled = true;
@@ -364,32 +366,56 @@
     //  WebRTC PeerConnection Management
     // ===================================================================
 
-    function createPeerConnection() {
-        cleanupPeerConnection();
+    function ensurePeerConnection() {
+        if (!pc) {
+            createPeerConnection();
+        }
+        return pc;
+    }
 
+    function createPeerConnection() {
+        if (pc) {
+            pc.close();
+            pc = null;
+        }
+
+        console.log('[WebRTC] Creating RTCPeerConnection with STUN servers');
         pc = new RTCPeerConnection(rtcConfig);
         remoteDescriptionSet = false;
-        pendingRemoteCandidates = [];
 
         // Attach local audio/video tracks
         if (localStream) {
             localStream.getTracks().forEach((track) => {
+                console.log('[WebRTC] Adding local track to PC:', track.kind, track.label);
                 pc.addTrack(track, localStream);
             });
         }
 
-        // Handle incoming remote tracks from stranger
+        // Handle incoming remote tracks from stranger (supports both streams[0] and individual tracks)
         pc.ontrack = (event) => {
+            console.log('[WebRTC] ontrack received:', event);
+            let stream = null;
             if (event.streams && event.streams[0]) {
-                dom.remoteVideo.srcObject = event.streams[0];
+                stream = event.streams[0];
+            } else if (event.track) {
+                if (!dom.remoteVideo.srcObject) {
+                    dom.remoteVideo.srcObject = new MediaStream();
+                }
+                dom.remoteVideo.srcObject.addTrack(event.track);
+                stream = dom.remoteVideo.srcObject;
+            }
+
+            if (stream) {
+                dom.remoteVideo.srcObject = stream;
+                dom.remoteVideo.play().catch((err) => console.warn('Remote video play error:', err));
                 dom.remotePlaceholder.classList.add('hidden');
                 dom.remoteConnStatus.className = 'conn-status-indicator live';
             }
         };
 
-        // Trickle ICE Candidates
+        // Trickle ICE Candidates (only send valid candidates)
         pc.onicecandidate = (event) => {
-            if (event.candidate) {
+            if (event.candidate && event.candidate.candidate) {
                 sendMessage({
                     type: 'webrtc_candidate',
                     candidate: event.candidate,
@@ -400,6 +426,7 @@
         // Peer connection state changes
         pc.onconnectionstatechange = () => {
             if (!pc) return;
+            console.log('[WebRTC] Connection state change:', pc.connectionState);
             switch (pc.connectionState) {
                 case 'connected':
                     dom.remoteConnStatus.className = 'conn-status-indicator live';
@@ -418,6 +445,7 @@
 
         pc.oniceconnectionstatechange = () => {
             if (!pc) return;
+            console.log('[WebRTC] ICE connection state:', pc.iceConnectionState);
             if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
                 dom.remotePlaceholder.classList.add('hidden');
                 dom.remoteConnStatus.className = 'conn-status-indicator live';
@@ -429,9 +457,10 @@
         if (mode !== Mode.VIDEO) return;
 
         try {
-            createPeerConnection();
+            ensurePeerConnection();
 
             if (isInitiator) {
+                console.log('[WebRTC] Acting as initiator: creating offer...');
                 const offer = await pc.createOffer({
                     offerToReceiveAudio: true,
                     offerToReceiveVideo: true,
@@ -442,9 +471,11 @@
                     type: 'webrtc_offer',
                     sdp: offer.sdp,
                 });
+            } else {
+                console.log('[WebRTC] Acting as receiver: waiting for remote offer...');
             }
         } catch (err) {
-            console.error('Error starting WebRTC call:', err);
+            console.error('[WebRTC] Error starting call:', err);
         }
     }
 
@@ -452,7 +483,8 @@
         if (mode !== Mode.VIDEO) return;
 
         try {
-            createPeerConnection();
+            console.log('[WebRTC] Received remote offer, creating answer...');
+            ensurePeerConnection();
             await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
             remoteDescriptionSet = true;
             await flushPendingCandidates();
@@ -468,7 +500,7 @@
             // Send initial media mute states to peer
             sendMediaToggleSignal();
         } catch (err) {
-            console.error('Error handling remote offer:', err);
+            console.error('[WebRTC] Error handling remote offer:', err);
         }
     }
 
@@ -476,6 +508,7 @@
         if (mode !== Mode.VIDEO || !pc) return;
 
         try {
+            console.log('[WebRTC] Received remote answer, setting remote description...');
             if (pc.signalingState !== 'stable') {
                 await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
                 remoteDescriptionSet = true;
@@ -485,7 +518,7 @@
                 sendMediaToggleSignal();
             }
         } catch (err) {
-            console.error('Error handling remote answer:', err);
+            console.error('[WebRTC] Error handling remote answer:', err);
         }
     }
 
@@ -500,7 +533,7 @@
                 pendingRemoteCandidates.push(candidate);
             }
         } catch (err) {
-            console.error('Error adding ICE candidate:', err);
+            console.error('[WebRTC] Error adding ICE candidate:', err);
         }
     }
 
@@ -511,7 +544,7 @@
             try {
                 await pc.addIceCandidate(candidate);
             } catch (err) {
-                console.error('Error adding queued ICE candidate:', err);
+                console.error('[WebRTC] Error adding queued ICE candidate:', err);
             }
         }
     }
@@ -547,7 +580,15 @@
         }
 
         dom.remotePlaceholder.classList.remove('hidden');
-        dom.remotePlaceholderText.textContent = 'Looking for a stranger...';
+        if (dom.remotePlaceholderText) {
+            if (state === State.SEARCHING) {
+                dom.remotePlaceholderText.textContent = 'Looking for a stranger...';
+            } else if (state === State.DISCONNECTED) {
+                dom.remotePlaceholderText.textContent = 'Stranger has disconnected';
+            } else {
+                dom.remotePlaceholderText.textContent = 'Looking for a stranger...';
+            }
+        }
         dom.remoteConnStatus.className = 'conn-status-indicator';
         dom.remoteCamOff.classList.add('hidden');
         dom.remoteMicOff.classList.add('hidden');
@@ -745,6 +786,10 @@
                 hideCommonInterests();
                 showTypingIndicator(false);
                 setStatus('Looking for a stranger...', 'searching');
+                if (dom.remotePlaceholderText) {
+                    dom.remotePlaceholderText.textContent = 'Looking for a stranger...';
+                }
+                dom.remotePlaceholder.classList.remove('hidden');
                 setMessageInputEnabled(false);
                 dom.disconnectBtn.classList.remove('hidden');
                 dom.newBtn.classList.add('hidden');
@@ -754,6 +799,9 @@
 
             case State.CHATTING:
                 setStatus("Connected with a random stranger! Say hi.", 'connected');
+                if (dom.remotePlaceholderText && mode === Mode.VIDEO) {
+                    dom.remotePlaceholderText.textContent = 'Connecting video...';
+                }
                 setMessageInputEnabled(true);
                 dom.messageInput.focus();
                 dom.disconnectBtn.classList.remove('hidden');
@@ -763,6 +811,10 @@
 
             case State.DISCONNECTED:
                 setStatus('Stranger has disconnected.', 'disconnected');
+                if (dom.remotePlaceholderText) {
+                    dom.remotePlaceholderText.textContent = 'Stranger has disconnected';
+                }
+                dom.remotePlaceholder.classList.remove('hidden');
                 setMessageInputEnabled(false);
                 showTypingIndicator(false);
                 dom.disconnectBtn.classList.add('hidden');
@@ -880,13 +932,14 @@
             } else {
                 // Step 2: Confirmed!
                 resetDisconnectConfirmation();
-                sendMessage({ type: 'next' });
+                sendMessage({ type: 'disconnect' });
                 cleanupPeerConnection();
-                appendSystemMessage('You have disconnected.');
+                appendSystemMessage('You have disconnected.', 'disconnected');
                 setState(State.DISCONNECTED);
                 resetTypingState();
             }
         } else if (state === State.SEARCHING) {
+            sendMessage({ type: 'leave_queue' });
             disconnectWebSocket();
             setState(State.IDLE);
         }
@@ -902,13 +955,21 @@
 
     function handleNewStrangerClick() {
         cleanupPeerConnection();
-        disconnectWebSocket();
-        connectWebSocket();
+        dom.chatLog.innerHTML = '';
+        setState(State.SEARCHING);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            sendMessage({ type: 'find_match' });
+        } else {
+            connectWebSocket();
+        }
     }
 
     function handleLeaveHomeClick() {
         cleanupPeerConnection();
         stopAllLocalMedia();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            sendMessage({ type: 'leave_queue' });
+        }
         disconnectWebSocket();
         setState(State.IDLE);
     }

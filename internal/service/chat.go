@@ -60,30 +60,53 @@ func (cs *ChatService) matchConsumer() {
 
 // createSession sets up a new chat session between two users and notifies them.
 func (cs *ChatService) createSession(user1, user2 string, commonInterests []string, mode string) {
+	// Verify both clients are actively connected in the Hub.
+	connected1 := cs.hub.IsClientConnected(user1)
+	connected2 := cs.hub.IsClientConnected(user2)
+
+	if !connected1 && !connected2 {
+		log.Printf("service: both users disconnected before session creation (%s, %s)", user1, user2)
+		return
+	}
+	if !connected1 {
+		log.Printf("service: user %s disconnected before session creation, re-enqueuing %s", user1, user2)
+		cs.enqueueWithCachedParams(user2)
+		return
+	}
+	if !connected2 {
+		log.Printf("service: user %s disconnected before session creation, re-enqueuing %s", user2, user1)
+		cs.enqueueWithCachedParams(user1)
+		return
+	}
+
+	cs.mu.Lock()
+	_, inSession1 := cs.sessions[user1]
+	_, inSession2 := cs.sessions[user2]
+
+	if inSession1 && inSession2 {
+		cs.mu.Unlock()
+		log.Printf("service: both users already in session (%s, %s)", user1, user2)
+		return
+	}
+	if inSession1 {
+		cs.mu.Unlock()
+		log.Printf("service: user %s already in session, re-enqueuing %s", user1, user2)
+		cs.enqueueWithCachedParams(user2)
+		return
+	}
+	if inSession2 {
+		cs.mu.Unlock()
+		log.Printf("service: user %s already in session, re-enqueuing %s", user2, user1)
+		cs.enqueueWithCachedParams(user1)
+		return
+	}
+
 	session := &models.Session{
 		User1:           user1,
 		User2:           user2,
 		CommonInterests: commonInterests,
 		Mode:            mode,
 		Initiator:       user1,
-	}
-
-	cs.mu.Lock()
-	// If either user already has a session (race between next and match),
-	// don't overwrite — re-enqueue both.
-	if _, exists := cs.sessions[user1]; exists {
-		cs.mu.Unlock()
-		log.Printf("service: user %s already in session, re-enqueuing both", user1)
-		cs.enqueueWithCachedParams(user1)
-		cs.enqueueWithCachedParams(user2)
-		return
-	}
-	if _, exists := cs.sessions[user2]; exists {
-		cs.mu.Unlock()
-		log.Printf("service: user %s already in session, re-enqueuing both", user2)
-		cs.enqueueWithCachedParams(user1)
-		cs.enqueueWithCachedParams(user2)
-		return
 	}
 
 	cs.sessions[user1] = session
@@ -93,20 +116,44 @@ func (cs *ChatService) createSession(user1, user2 string, commonInterests []stri
 	log.Printf("service: session created between %s and %s in mode %s (common: %v)", user1, user2, mode, commonInterests)
 
 	// Notify both users they've been matched, assigning User1 as the WebRTC offer initiator.
-	cs.hub.SendToClient(user1, models.Message{
+	sent1 := cs.hub.SendToClient(user1, models.Message{
 		Type:            models.MessageTypeSystem,
 		Content:         "You're now chatting with a random stranger. Say hi!",
 		CommonInterests: commonInterests,
 		Mode:            mode,
 		IsInitiator:     true,
 	})
-	cs.hub.SendToClient(user2, models.Message{
+	sent2 := cs.hub.SendToClient(user2, models.Message{
 		Type:            models.MessageTypeSystem,
 		Content:         "You're now chatting with a random stranger. Say hi!",
 		CommonInterests: commonInterests,
 		Mode:            mode,
 		IsInitiator:     false,
 	})
+
+	// If sending failed to either peer (connection dropped right during match), clean up
+	if !sent1 || !sent2 {
+		log.Printf("service: failed to deliver matched message (sent1=%v, sent2=%v), tearing down session", sent1, sent2)
+		cs.mu.Lock()
+		delete(cs.sessions, user1)
+		delete(cs.sessions, user2)
+		session.Close()
+		cs.mu.Unlock()
+
+		if sent1 && !sent2 {
+			cs.hub.SendToClient(user1, models.Message{
+				Type:    models.MessageTypeSystem,
+				Content: "Stranger disconnected. Looking for a new stranger...",
+			})
+			cs.enqueueWithCachedParams(user1)
+		} else if sent2 && !sent1 {
+			cs.hub.SendToClient(user2, models.Message{
+				Type:    models.MessageTypeSystem,
+				Content: "Stranger disconnected. Looking for a new stranger...",
+			})
+			cs.enqueueWithCachedParams(user2)
+		}
+	}
 }
 
 // HandleMessage processes an incoming message from a client.
@@ -121,6 +168,15 @@ func (cs *ChatService) HandleMessage(clientID string, msg models.Message) {
 
 	case models.MessageTypeNext:
 		cs.HandleNext(clientID)
+
+	case models.MessageTypeDisconnect:
+		cs.HandleDisconnectSession(clientID)
+
+	case models.MessageTypeFindMatch:
+		cs.HandleFindMatch(clientID)
+
+	case models.MessageTypeLeaveQueue:
+		cs.queue.Dequeue(clientID)
 
 	case models.MessageTypeTyping:
 		cs.relayTypingStatus(clientID, models.MessageTypeTyping)
@@ -176,7 +232,40 @@ func (cs *ChatService) relayMessage(senderID string, msg models.Message) {
 	}
 
 	// Forward message with all fields (SDP, candidate, mediaState, etc.) intact.
+	log.Printf("service: relaying %s from %s to %s", msg.Type, senderID, partnerID)
 	cs.hub.SendToClient(partnerID, msg)
+}
+
+// HandleDisconnectSession ends the active session for userID and notifies their partner.
+// Neither user is automatically re-enqueued; each will see the New button and choose when to search.
+func (cs *ChatService) HandleDisconnectSession(userID string) {
+	cs.mu.Lock()
+	session, exists := cs.sessions[userID]
+	if !exists || session == nil {
+		cs.mu.Unlock()
+		return
+	}
+
+	partnerID := session.Partner(userID)
+	delete(cs.sessions, userID)
+	delete(cs.sessions, partnerID)
+	cs.mu.Unlock()
+
+	if session.Close() {
+		log.Printf("service: user %s ended session with %s", userID, partnerID)
+		if partnerID != "" {
+			cs.hub.SendToClient(partnerID, models.Message{
+				Type:    models.MessageTypeSystem,
+				Content: "Stranger has disconnected.",
+			})
+		}
+	}
+}
+
+// HandleFindMatch places the user into the matchmaking queue.
+func (cs *ChatService) HandleFindMatch(userID string) {
+	cs.HandleDisconnectSession(userID)
+	cs.enqueueWithCachedParams(userID)
 }
 
 // HandleNext disconnects the user from their current session and re-enqueues
@@ -186,7 +275,7 @@ func (cs *ChatService) HandleNext(userID string) {
 	session, exists := cs.sessions[userID]
 	if !exists || session == nil {
 		cs.mu.Unlock()
-		// Not in a session — just ensure they're in the queue.
+		// Not in a session — ensure they're in the queue.
 		cs.enqueueWithCachedParams(userID)
 		return
 	}
@@ -208,8 +297,6 @@ func (cs *ChatService) HandleNext(userID string) {
 				Type:    models.MessageTypeSystem,
 				Content: "Stranger has disconnected.",
 			})
-			// Re-enqueue the partner so they can find a new match.
-			cs.enqueueWithCachedParams(partnerID)
 		}
 	}
 
@@ -254,8 +341,6 @@ func (cs *ChatService) HandleDisconnect(userID string) {
 				Type:    models.MessageTypeSystem,
 				Content: "Stranger has disconnected.",
 			})
-			// Re-enqueue the partner for a new match.
-			cs.enqueueWithCachedParams(partnerID)
 		}
 	}
 }

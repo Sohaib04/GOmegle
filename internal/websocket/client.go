@@ -3,6 +3,7 @@ package websocket
 import (
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
@@ -36,6 +37,9 @@ type Client struct {
 
 	// Hub is the connection registry this client belongs to.
 	Hub *Hub
+
+	closed  bool
+	closeMu sync.RWMutex
 }
 
 // NewClient creates a new Client instance.
@@ -45,6 +49,35 @@ func NewClient(id string, conn *websocket.Conn, hub *Hub) *Client {
 		Conn: conn,
 		Send: make(chan []byte, 256),
 		Hub:  hub,
+	}
+}
+
+// SendMessage safely queues a message to the Send channel without panicking if closed.
+func (c *Client) SendMessage(data []byte) bool {
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+
+	if c.closed {
+		return false
+	}
+
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		log.Printf("client %s send buffer full, dropping message", c.ID)
+		return false
+	}
+}
+
+// Close safely marks the client as closed and closes the Send channel.
+func (c *Client) Close() {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+
+	if !c.closed {
+		c.closed = true
+		close(c.Send)
 	}
 }
 

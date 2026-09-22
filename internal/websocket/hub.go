@@ -3,6 +3,7 @@ package websocket
 import (
 	"encoding/json"
 	"log"
+	"sync"
 
 	"github.com/sohaib_04/GOmegle/internal/models"
 )
@@ -13,20 +14,6 @@ type IncomingMessage struct {
 	Message  models.Message
 }
 
-// sendRequest is used to send a message to a specific client through the
-// Run() goroutine, eliminating race conditions on the clients map.
-type sendRequest struct {
-	ClientID string
-	Data     []byte
-	Result   chan bool
-}
-
-// countRequest is used to get the current client count through the
-// Run() goroutine, eliminating race conditions on the clients map.
-type countRequest struct {
-	Result chan int
-}
-
 // MessageHandler is a callback invoked when a message arrives from a client.
 type MessageHandler func(clientID string, msg models.Message)
 
@@ -34,11 +21,12 @@ type MessageHandler func(clientID string, msg models.Message)
 type DisconnectHandler func(clientID string)
 
 // Hub maintains the set of active clients and broadcasts messages.
-// All access to the clients map is serialized through the Run() goroutine
-// to avoid races — no mutex needed.
+// A sync.RWMutex protects the clients map to prevent race conditions
+// and completely eliminate goroutine deadlocks on synchronous message relaying.
 type Hub struct {
 	// clients is the set of registered clients, keyed by client ID.
 	clients map[string]*Client
+	mu      sync.RWMutex
 
 	// Register channel for new clients.
 	Register chan *Client
@@ -48,12 +36,6 @@ type Hub struct {
 
 	// Incoming channel for messages from clients.
 	Incoming chan *IncomingMessage
-
-	// send routes send requests through Run() to avoid races.
-	send chan sendRequest
-
-	// count routes count requests through Run() to avoid races.
-	count chan countRequest
 
 	// OnMessage is called when a message is received from a client.
 	OnMessage MessageHandler
@@ -68,60 +50,47 @@ func NewHub() *Hub {
 		clients:    make(map[string]*Client),
 		Register:   make(chan *Client),
 		Unregister: make(chan *Client),
-		Incoming:   make(chan *IncomingMessage, 256),
-		send:       make(chan sendRequest, 256),
-		count:      make(chan countRequest),
+		Incoming:   make(chan *IncomingMessage, 512),
 	}
 }
 
 // Run starts the Hub's event loop. This must be called in a goroutine.
-// It serializes all client map access, making the Hub fully thread-safe
-// without any mutexes.
 func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.Register:
+			h.mu.Lock()
 			h.clients[client.ID] = client
-			log.Printf("client registered: %s (total: %d)", client.ID, len(h.clients))
+			total := len(h.clients)
+			h.mu.Unlock()
+			log.Printf("client registered: %s (total: %d)", client.ID, total)
 
 		case client := <-h.Unregister:
+			h.mu.Lock()
 			if _, ok := h.clients[client.ID]; ok {
 				delete(h.clients, client.ID)
-				close(client.Send)
-				log.Printf("client unregistered: %s (total: %d)", client.ID, len(h.clients))
+				client.Close()
+				total := len(h.clients)
+				h.mu.Unlock()
+				log.Printf("client unregistered: %s (total: %d)", client.ID, total)
 
 				if h.OnDisconnect != nil {
-					h.OnDisconnect(client.ID)
+					go h.OnDisconnect(client.ID)
 				}
+			} else {
+				h.mu.Unlock()
 			}
 
 		case incoming := <-h.Incoming:
 			if h.OnMessage != nil {
-				h.OnMessage(incoming.ClientID, incoming.Message)
+				go h.OnMessage(incoming.ClientID, incoming.Message)
 			}
-
-		case req := <-h.send:
-			client, ok := h.clients[req.ClientID]
-			if !ok {
-				req.Result <- false
-				continue
-			}
-			select {
-			case client.Send <- req.Data:
-				req.Result <- true
-			default:
-				log.Printf("client %s send buffer full, dropping message", req.ClientID)
-				req.Result <- false
-			}
-
-		case req := <-h.count:
-			req.Result <- len(h.clients)
 		}
 	}
 }
 
 // SendToClient sends a message to a specific client by ID.
-// This is thread-safe — the request is routed through the Run() goroutine.
+// Thread-safe and non-blocking — acquires read lock on clients map and queues to client channel.
 func (h *Hub) SendToClient(clientID string, msg models.Message) bool {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -129,22 +98,28 @@ func (h *Hub) SendToClient(clientID string, msg models.Message) bool {
 		return false
 	}
 
-	req := sendRequest{
-		ClientID: clientID,
-		Data:     data,
-		Result:   make(chan bool, 1),
+	h.mu.RLock()
+	client, ok := h.clients[clientID]
+	h.mu.RUnlock()
+
+	if !ok {
+		return false
 	}
 
-	h.send <- req
-	return <-req.Result
+	return client.SendMessage(data)
+}
+
+// IsClientConnected checks if a client with the given ID is actively registered in the Hub.
+func (h *Hub) IsClientConnected(clientID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.clients[clientID]
+	return ok
 }
 
 // ClientCount returns the number of currently connected clients.
-// This is thread-safe — the request is routed through the Run() goroutine.
 func (h *Hub) ClientCount() int {
-	req := countRequest{
-		Result: make(chan int, 1),
-	}
-	h.count <- req
-	return <-req.Result
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
 }
