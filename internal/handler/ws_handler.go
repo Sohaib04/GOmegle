@@ -59,7 +59,13 @@ func (h *WSHandler) HandleWebSocket() fiber.Handler {
 			}
 		}
 
-		log.Printf("handler: new WebSocket connection: %s (interests: %v)", clientID, interests)
+		// Parse mode from query parameter (default "text", or "video").
+		mode := strings.ToLower(strings.TrimSpace(c.Query("mode", "text")))
+		if mode != "video" {
+			mode = "text"
+		}
+
+		log.Printf("handler: new WebSocket connection: %s (mode: %s, interests: %v)", clientID, mode, interests)
 
 		// Create the client.
 		client := ws.NewClient(clientID, c, h.hub)
@@ -70,8 +76,8 @@ func (h *WSHandler) HandleWebSocket() fiber.Handler {
 		// Start the write pump in a goroutine.
 		go client.WritePump()
 
-		// Enqueue for matchmaking with interests.
-		h.chatService.EnqueueUser(clientID, interests)
+		// Enqueue for matchmaking with interests and mode.
+		h.chatService.EnqueueUser(clientID, interests, mode)
 
 		// ReadPump blocks until the connection closes.
 		// This is intentional — the Fiber WebSocket handler expects

@@ -19,8 +19,8 @@ const (
 	// pingPeriod sends pings to peer with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
 
-	// maxMessageSize is the maximum message size allowed from peer.
-	maxMessageSize = 4096
+	// maxMessageSize is the maximum message size allowed from peer (128 KB for WebRTC SDP payloads).
+	maxMessageSize = 131072
 )
 
 // Client represents a single WebSocket connection.

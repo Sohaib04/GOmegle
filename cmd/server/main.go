@@ -56,9 +56,19 @@ func main() {
 	app.Get("/ws", wsHandler.HandleWebSocket())
 
 	// --- 6. Serve static frontend files ---
+	// Disable client caching so UI updates and scripts load immediately without stale cache.
+	app.Use(func(c *fiber.Ctx) error {
+		c.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		c.Set("Pragma", "no-cache")
+		c.Set("Expires", "0")
+		return c.Next()
+	})
+
 	app.Static("/", "./web", fiber.Static{
-		Index:  "index.html",
-		Browse: false,
+		Index:         "index.html",
+		Browse:        false,
+		CacheDuration: -1,
+		MaxAge:        0,
 	})
 
 	// --- 7. Graceful shutdown ---
