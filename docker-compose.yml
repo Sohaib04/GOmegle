@@ -1,0 +1,10 @@
+services:
+  gomegle:
+    build: .
+    container_name: gomegle
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+
